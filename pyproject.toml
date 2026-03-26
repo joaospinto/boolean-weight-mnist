@@ -1,0 +1,17 @@
+[project]
+name = "jax-nn-mnist-binary-weights"
+version = "0.1.0"
+description = "Toy project for binary weights on MNIST using JAX/Flax"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "flax",
+    "jax",
+    "jaxlib",
+    "matplotlib",
+    "mnist",
+    "optax",
+    "scikit-learn",
+    "tqdm",
+    "numpy",
+]
