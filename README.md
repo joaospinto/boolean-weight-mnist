@@ -1,6 +1,6 @@
 # JAX-NN-MNIST-Binary-Weights
 
-A **Binary Neural Network** for MNIST where inference runs entirely on boolean arrays and integer arithmetic — no floating point at test time. Trained with JAX/Flax, achieves **94.2%** accuracy using only threshold gates.
+A **Binary Neural Network** for MNIST where inference runs entirely on boolean arrays and integer arithmetic — no floating point at test time. Trained with JAX/Flax, achieves **91.9%** accuracy using only threshold gates.
 
 https://github.com/user-attachments/assets/5aa496ec-83b6-40a3-875e-a9229f85bf69
 
@@ -11,9 +11,9 @@ https://github.com/user-attachments/assets/5aa496ec-83b6-40a3-875e-a9229f85bf69
 At test time, each hidden layer computes:
 
 1. **Count** active inputs: `count = bool_input @ bool_weights` (integer)
-2. **Threshold**: `gate_fires = count > T` (boolean)
+2. **Normalize & threshold**: LayerNorm parameters are folded into an integer comparison using a squaring trick to eliminate the square root, so `gate_fires` is determined purely from integer arithmetic.
 
-The output layer counts how many gates fired per class and picks the argmax. No sigmoid, no BatchNorm, no floats — just boolean arrays and integer comparisons.
+The output layer counts how many gates fired per class and picks the argmax. No sigmoid, no LayerNorm, no floats — just boolean arrays and integer comparisons.
 
 ### Training with Straight-Through Estimator
 
@@ -21,7 +21,7 @@ During training, the network uses continuous relaxations so gradients can flow:
 
 - **Binary weights via STE:** Forward pass uses hard `w = (w_raw > 0)`, backward pass uses `sigmoid(w_raw)` gradients.
 - **Binary activations via STE:** Same trick for hidden activations — hard threshold forward, smooth sigmoid backward.
-- **BatchNorm** normalizes pre-activations during training; at inference, BN parameters are folded into integer thresholds.
+- **LayerNorm** normalizes pre-activations during training; at inference, LN scale/bias are folded into integer comparisons via a squaring trick that avoids the square root entirely.
 - **Input augmentation:** Inputs are augmented as `[x, NOT(x)]` to provide both positive and negative literals (since threshold gates are monotone).
 
 ### Augmented Lagrangian Binarization
@@ -42,13 +42,13 @@ Input: 784 binary pixels
   v  augment with [x, NOT(x)]
 1568 binary inputs
   |
-  v  BinaryDense(2048) -> BN -> threshold -> bool
+  v  BinaryDense(2048) -> LN -> threshold -> bool
 2048 threshold gates
   |
-  v  BinaryDense(1024) -> BN -> threshold -> bool
+  v  BinaryDense(1024) -> LN -> threshold -> bool
 1024 threshold gates
   |
-  v  BinaryDense(512) -> BN -> threshold -> bool
+  v  BinaryDense(512) -> LN -> threshold -> bool
 512 threshold gates
   |
   v  BinaryDense(10) -> argmax of integer counts
@@ -77,7 +77,7 @@ uv run python main.py
 uv run python main.py --eval
 ```
 
-This loads the trained model, extracts integer thresholds from BatchNorm, and runs inference with zero floating point.
+This loads the trained model, folds LayerNorm into integer comparisons, and runs inference with zero floating point.
 
 ### Parameters
 

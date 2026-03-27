@@ -12,16 +12,38 @@ def boolean_forward_with_activations(x_bool, layers):
 
     for layer in layers[:-1]:
         w = layer['w']
-        threshold = layer['threshold']
-        scale_pos = layer['scale_positive']
+        scale = layer['ln_scale']
+        bias = layer['ln_bias']
+        N = w.shape[1]
 
-        counts = x.astype(np.int32) @ w.astype(np.int32)
-        fired = counts > threshold[None, :]
-        x = np.where(scale_pos[None, :], fired, ~fired)
+        counts = x.astype(np.float32) @ w.astype(np.float32)
+        counts = np.round(counts).astype(np.int64)
+
+        S = counts.sum(axis=1, keepdims=True)
+        S2 = (counts ** 2).sum(axis=1, keepdims=True)
+        Q = N * S2 - S ** 2
+
+        PRECISION = 512
+        scale_int = np.round(scale * PRECISION).astype(np.int64)
+        bias_int = np.round(bias * PRECISION).astype(np.int64)
+
+        A = scale_int[None, :] * (N * counts - S)
+        A2 = A ** 2
+        B2Q = bias_int[None, :] ** 2 * Q
+
+        a_pos = A >= 0
+        b_pos = bias_int[None, :] >= 0
+
+        fired = ((a_pos & b_pos) |
+                 (a_pos & ~b_pos & (A2 > B2Q)) |
+                 (~a_pos & b_pos & (B2Q > A2)))
+
+        x = fired
         activations.append(x)
 
     w_out = layers[-1]['w']
-    scores = x.astype(np.int32) @ w_out.astype(np.int32)
+    scores = x.astype(np.float32) @ w_out.astype(np.float32)
+    scores = np.round(scores).astype(np.int32)
     return activations, scores
 
 
@@ -36,14 +58,7 @@ def main():
         else:
             params[k] = np.array(v)
 
-    batch_stats = {}
-    for k, v in saved['batch_stats'].items():
-        if hasattr(v, 'items'):
-            batch_stats[k] = {kk: np.array(vv) for kk, vv in v.items()}
-        else:
-            batch_stats[k] = np.array(v)
-
-    layers = extract_boolean_model(params, batch_stats)
+    layers = extract_boolean_model(params)
     (_, _), (x_test, y_test) = get_datasets()
 
     # Pick 10 diverse examples (one per digit)
@@ -59,7 +74,7 @@ def main():
     n_hidden = len(activations)
     n_panels = 1 + n_hidden + 1  # input + hidden layers + output
     fig, axes = plt.subplots(1, n_panels, figsize=(4 * n_panels, 5))
-    fig.suptitle("Boolean Neural Network — Pure Integer/Boolean Forward Pass (94.2% accuracy)",
+    fig.suptitle("Boolean Neural Network — Pure Integer/Boolean Forward Pass (91.9% accuracy)",
                  fontsize=14)
 
     # Grid shapes for displaying each hidden layer as a 2D boolean image

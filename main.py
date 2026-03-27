@@ -30,10 +30,10 @@ def get_datasets():
 
 
 def augment_batch(images, rng):
-    """Random ±2 pixel shifts on binary 28x28 images."""
+    """Random +/-2 pixel shifts on binary 28x28 images."""
     batch = images.reshape(-1, 28, 28)
     n = len(batch)
-    shifts = rng.integers(-2, 3, size=(n, 2))  # shift_y, shift_x
+    shifts = rng.integers(-2, 3, size=(n, 2))
     out = np.zeros_like(batch)
     for i in range(n):
         dy, dx = shifts[i]
@@ -76,7 +76,7 @@ class BinaryDense(nn.Module):
         w_hard = (w_raw > 0.0).astype(jnp.float32)
         w = w_soft + jax.lax.stop_gradient(w_hard - w_soft)
 
-        return x @ w  # no bias — BatchNorm handles centering
+        return x @ w  # no bias — LayerNorm handles centering
 
 
 def binary_activation(x, alpha=4.0):
@@ -90,61 +90,49 @@ class BinaryNN(nn.Module):
     num_classes: int = 10
 
     @nn.compact
-    def __call__(self, x, train=True):
+    def __call__(self, x, **kwargs):
         # Augment with negations: [x, NOT(x)] gives both pos and neg literals
         x = jnp.concatenate([x, 1.0 - x], axis=-1)
-        # Layer 1: 1568 → 2048
+        # Layer 1: 1568 -> 2048
         x = BinaryDense(2048, num_active=25)(x)
-        x = nn.BatchNorm(use_running_average=not train)(x)
+        x = nn.LayerNorm()(x)
         x = binary_activation(x, alpha=4.0)
-        # Layer 2: 2048 → 1024
+        # Layer 2: 2048 -> 1024
         x = BinaryDense(1024, num_active=30)(x)
-        x = nn.BatchNorm(use_running_average=not train)(x)
+        x = nn.LayerNorm()(x)
         x = binary_activation(x, alpha=4.0)
-        # Layer 3: 1024 → 512
+        # Layer 3: 1024 -> 512
         x = BinaryDense(512, num_active=35)(x)
-        x = nn.BatchNorm(use_running_average=not train)(x)
+        x = nn.LayerNorm()(x)
         x = binary_activation(x, alpha=3.0)
-        # Output: 512 → 10
+        # Output: 512 -> 10
         return BinaryDense(self.num_classes, num_active=80)(x)
-
-
-# --- Training State (with batch_stats for BatchNorm) ---
-
-class TrainState(train_state.TrainState):
-    batch_stats: dict
 
 
 # --- Loss ---
 
-def loss_fn(params, batch_stats, images, labels, rho, lmbda):
-    logits, updates = BinaryNN().apply(
-        {'params': params, 'batch_stats': batch_stats},
-        images, train=True,
-        mutable=['batch_stats'])
-    new_batch_stats = updates['batch_stats']
+def loss_fn(params, images, labels, rho, lmbda):
+    logits = BinaryNN().apply({'params': params}, images)
 
     ce = optax.softmax_cross_entropy(logits, jax.nn.one_hot(labels, 10)).mean()
 
     # Augmented Lagrangian: push weights toward {0,1}
     def penalty(p, l):
-        if p.ndim < 2:  # skip biases and BN params (1D)
+        if p.ndim < 2:  # skip biases and LN params (1D)
             return jnp.float32(0.0)
         w = jax.nn.sigmoid(p)
         c = w * (1.0 - w)
         return jnp.sum(l * c + (rho / 2.0) * c ** 2)
 
     pen = sum(jax.tree_util.tree_leaves(jax.tree_util.tree_map(penalty, params, lmbda)))
-    return ce + pen, (ce, new_batch_stats)
+    return ce + pen, ce
 
 
 @jax.jit
 def train_step(state, images, labels, rho, lmbda):
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (ce, new_batch_stats)), grads = grad_fn(
-        state.params, state.batch_stats, images, labels, rho, lmbda)
+    (loss, ce), grads = grad_fn(state.params, images, labels, rho, lmbda)
     state = state.apply_gradients(grads=grads)
-    state = state.replace(batch_stats=new_batch_stats)
     return state, ce
 
 
@@ -152,8 +140,7 @@ def evaluate(state, images, labels):
     correct = 0
     for i in range(0, len(images), 1000):
         logits = BinaryNN().apply(
-            {'params': state.params, 'batch_stats': state.batch_stats},
-            images[i:i+1000], train=False)
+            {'params': state.params}, images[i:i+1000])
         correct += int(jnp.sum(jnp.argmax(logits, -1) == labels[i:i+1000]))
     return correct / len(images)
 
@@ -169,43 +156,34 @@ def binariness(params):
 
 # --- Pure Boolean/Integer Inference ---
 
-def extract_boolean_model(params, batch_stats):
-    """Extract binary weights and integer thresholds from trained model.
+def extract_boolean_model(params):
+    """Extract binary weights and LayerNorm params from trained model.
 
-    Automatically detects the number of BinaryDense and BatchNorm layers.
-    Hidden layers have 'w', 'threshold', 'scale_positive'.
-    Output layer (last BinaryDense, no BN) has only 'w'.
+    Hidden layers have:
+      - 'w': bool array (input_dim, output_dim)
+      - 'ln_scale': float array (output_dim,) — LayerNorm scale
+      - 'ln_bias': float array (output_dim,) — LayerNorm bias
+    Output layer has only 'w'.
     """
-    # Find all BinaryDense and BatchNorm layers
     dense_names = sorted([k for k in params if k.startswith('BinaryDense_')],
                          key=lambda s: int(s.split('_')[1]))
-    bn_names = sorted([k for k in params if k.startswith('BatchNorm_')],
+    ln_names = sorted([k for k in params if k.startswith('LayerNorm_')],
                       key=lambda s: int(s.split('_')[1]))
 
     layers = []
-    # Hidden layers: each has a matching BN
-    for layer_name, bn_name in zip(dense_names[:-1], bn_names):
+    for layer_name, ln_name in zip(dense_names[:-1], ln_names):
         w_raw = np.array(params[layer_name]['w'])
         w_bin = w_raw > 0.0
 
-        scale = np.array(params[bn_name]['scale'])
-        bias = np.array(params[bn_name]['bias'])
-        mean = np.array(batch_stats[bn_name]['mean'])
-        var = np.array(batch_stats[bn_name]['var'])
-        eps = 1e-5
-        std = np.sqrt(var + eps)
-
-        raw_threshold = mean - bias * std / scale
-        threshold = np.floor(raw_threshold).astype(np.int32)
-        scale_positive = scale > 0
+        scale = np.array(params[ln_name]['scale'])
+        bias = np.array(params[ln_name]['bias'])
 
         layers.append({
             'w': w_bin,
-            'threshold': threshold,
-            'scale_positive': scale_positive,
+            'ln_scale': scale,
+            'ln_bias': bias,
         })
 
-    # Output layer: no BN
     w_raw = np.array(params[dense_names[-1]]['w'])
     layers.append({'w': w_raw > 0.0})
 
@@ -213,20 +191,61 @@ def extract_boolean_model(params, batch_stats):
 
 
 def boolean_forward(x_bool, layers):
-    """Pure boolean/integer forward pass. No floating point."""
+    """Pure boolean/integer forward pass with LayerNorm folded into integer comparisons.
+
+    For each hidden layer, gate i fires when:
+        scale_i * (count_i - mean) / std + bias_i > 0
+
+    We eliminate the sqrt by squaring. Let:
+        A_i = scale_i * (N * count_i - S)   where S = sum(counts), N = num_gates
+        B_i = bias_i
+        Q   = N * sum(counts^2) - S^2        (= N^2 * var)
+
+    Then gate_i fires iff A_i + B_i * sqrt(Q) > 0, which we resolve by:
+        - A_i >= 0 and B_i >= 0  =>  fire
+        - A_i <= 0 and B_i <= 0  =>  don't fire
+        - Otherwise: compare A_i^2 vs B_i^2 * Q
+    """
     x = np.concatenate([x_bool, ~x_bool], axis=-1)
 
     for layer in layers[:-1]:
         w = layer['w']
-        threshold = layer['threshold']
-        scale_pos = layer['scale_positive']
+        scale = layer['ln_scale']
+        bias = layer['ln_bias']
+        N = w.shape[1]
 
-        counts = x.astype(np.int32) @ w.astype(np.int32)
-        fired = counts > threshold[None, :]
-        x = np.where(scale_pos[None, :], fired, ~fired)
+        # Use float32 matmul (BLAS-accelerated, exact for small integer counts)
+        counts = x.astype(np.float32) @ w.astype(np.float32)
+        counts = np.round(counts).astype(np.int64)
 
+        S = counts.sum(axis=1, keepdims=True)
+        S2 = (counts ** 2).sum(axis=1, keepdims=True)
+        Q = N * S2 - S ** 2  # = N^2 * var, always >= 0
+
+        # Fixed-point scale/bias. Precision must keep A^2 < 9.2e18 (int64 max).
+        PRECISION = 512
+        scale_int = np.round(scale * PRECISION).astype(np.int64)
+        bias_int = np.round(bias * PRECISION).astype(np.int64)
+
+        # A_i = scale_i * (N * count_i - S)
+        A = scale_int[None, :] * (N * counts - S)
+        A2 = A ** 2
+        B2Q = bias_int[None, :] ** 2 * Q
+
+        # Gate fires iff scale*(count-mean)/std + bias > 0
+        # iff A + bias*sqrt(Q) > 0, resolved by squaring:
+        a_pos = A >= 0
+        b_pos = bias_int[None, :] >= 0
+
+        fired = ((a_pos & b_pos) |
+                 (a_pos & ~b_pos & (A2 > B2Q)) |
+                 (~a_pos & b_pos & (B2Q > A2)))
+
+        x = fired
+
+    # Output layer
     w_out = layers[-1]['w']
-    scores = x.astype(np.int32) @ w_out.astype(np.int32)
+    scores = x.astype(np.float32) @ w_out.astype(np.float32)
     return np.argmax(scores, axis=-1)
 
 
@@ -245,9 +264,8 @@ def boolean_evaluate(model_path='best_model.pkl'):
         return out
 
     params = to_numpy_dict(saved['params'])
-    batch_stats = to_numpy_dict(saved['batch_stats'])
 
-    layers = extract_boolean_model(params, batch_stats)
+    layers = extract_boolean_model(params)
 
     print("Boolean network structure:")
     for i, layer in enumerate(layers[:-1]):
@@ -256,11 +274,6 @@ def boolean_evaluate(model_path='best_model.pkl'):
         print(f"  Layer {i+1}: {w.shape[0]} bool inputs -> {w.shape[1]} threshold gates")
         print(f"    Connections per gate: min={int(active.min())}, "
               f"median={int(np.median(active))}, max={int(active.max())}")
-        print(f"    Thresholds: min={int(layer['threshold'].min())}, "
-              f"max={int(layer['threshold'].max())}")
-        neg = (~layer['scale_positive']).sum()
-        if neg > 0:
-            print(f"    Inverted gates (negative BN scale): {neg}")
     w_out = layers[-1]['w']
     active_per_class = w_out.sum(axis=0)
     print(f"  Output: {w_out.shape[0]} bool inputs -> {w_out.shape[1]} classes (argmax of int counts)")
@@ -304,7 +317,7 @@ def main():
 
     model = BinaryNN()
     key = jax.random.PRNGKey(42)
-    variables = model.init(key, jnp.ones((1, 784)), train=True)
+    variables = model.init(key, jnp.ones((1, 784)))
 
     n_params = sum(p.size for p in jax.tree_util.tree_leaves(variables['params']))
     print(f"Parameters: {n_params}")
@@ -318,13 +331,12 @@ def main():
     ], [warmup_steps])
     tx = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(schedule))
 
-    state = TrainState.create(
+    state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=variables['params'],
-        tx=tx,
-        batch_stats=variables['batch_stats'])
+        tx=tx)
 
-    rho = 0.0  # Start with no binarization pressure
+    rho = 0.0
     lmbda = jax.tree_util.tree_map(jnp.zeros_like, state.params)
     best_acc = 0.0
     aug_rng = np.random.default_rng(42)
@@ -360,10 +372,7 @@ def main():
         if acc > best_acc:
             best_acc = acc
             with open('best_model.pkl', 'wb') as f:
-                pickle.dump({
-                    'params': state.params,
-                    'batch_stats': state.batch_stats,
-                }, f)
+                pickle.dump({'params': state.params}, f)
 
     print(f"\nBest accuracy: {best_acc:.3f}")
     print("\nRunning pure boolean evaluation...")
