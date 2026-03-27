@@ -190,7 +190,7 @@ def extract_boolean_model(params):
     return layers
 
 
-def boolean_forward(x_bool, layers):
+def boolean_forward(x_bool, layers, return_activations=False):
     """Pure boolean/integer forward pass with LayerNorm folded into integer comparisons.
 
     For each hidden layer, gate i fires when:
@@ -207,6 +207,7 @@ def boolean_forward(x_bool, layers):
         - Otherwise: compare A_i^2 vs B_i^2 * Q
     """
     x = np.concatenate([x_bool, ~x_bool], axis=-1)
+    activations = [] if return_activations else None
 
     for layer in layers[:-1]:
         w = layer['w']
@@ -242,10 +243,16 @@ def boolean_forward(x_bool, layers):
                  (~a_pos & b_pos & (B2Q > A2)))
 
         x = fired
+        if return_activations:
+            activations.append(x)
 
     # Output layer
     w_out = layers[-1]['w']
     scores = x.astype(np.float32) @ w_out.astype(np.float32)
+    scores = np.round(scores).astype(np.int32)
+
+    if return_activations:
+        return np.argmax(scores, axis=-1), activations, scores
     return np.argmax(scores, axis=-1)
 
 
