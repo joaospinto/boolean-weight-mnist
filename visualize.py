@@ -2,21 +2,21 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
-from main import extract_boolean_model, boolean_forward, get_datasets
+from main import boolean_forward, get_datasets
 
 
 def main():
     with open('best_model.pkl', 'rb') as f:
         saved = pickle.load(f)
 
-    params = {}
-    for k, v in saved['params'].items():
-        if hasattr(v, 'items'):
-            params[k] = {kk: np.array(vv) for kk, vv in v.items()}
-        else:
-            params[k] = np.array(v)
-
-    layers = extract_boolean_model(params)
+    if 'layers' in saved:
+        layers = saved['layers']
+    else:
+        from main import extract_boolean_model
+        params = {k: ({kk: np.array(vv) for kk, vv in v.items()}
+                      if hasattr(v, 'items') else np.array(v))
+                  for k, v in saved['params'].items()}
+        layers = extract_boolean_model(params)
     (_, _), (x_test, y_test) = get_datasets()
 
     # Pick 10 diverse examples (one per digit)
@@ -32,12 +32,18 @@ def main():
     n_hidden = len(activations)
     n_panels = 1 + n_hidden + 1
     fig, axes = plt.subplots(1, n_panels, figsize=(4 * n_panels, 5))
-    fig.suptitle("Boolean Neural Network — Pure Integer/Boolean Forward Pass (91.9% accuracy)",
+    fig.suptitle("Boolean Neural Network — Pure Integer/Boolean Forward Pass (93.6% accuracy)",
                  fontsize=14)
 
-    grid_shapes = [(32, 64), (32, 32), (16, 32)]
-    layer_colors = ['Greens', 'Blues', 'Purples']
-    layer_sizes = [2048, 1024, 512]
+    # Compute grid shapes from layer sizes
+    layer_sizes = [a.shape[1] for a in activations]
+    grid_shapes = []
+    for size in layer_sizes:
+        w = int(np.ceil(np.sqrt(size * 2)))
+        h = int(np.ceil(size / w))
+        grid_shapes.append((h, w))
+
+    layer_colors = ['Greens', 'Blues', 'Purples', 'Oranges', 'Reds']
 
     def update(frame):
         for ax in axes.flatten():
@@ -51,9 +57,13 @@ def main():
 
         for i in range(n_hidden):
             h, w = grid_shapes[i]
-            grid = activations[i][frame].astype(np.uint8).reshape(h, w)
-            axes[i + 1].imshow(grid, cmap=layer_colors[i], vmin=0, vmax=1,
-                               interpolation='nearest')
+            act = activations[i][frame].astype(np.uint8)
+            # Pad to fill grid
+            padded = np.zeros(h * w, dtype=np.uint8)
+            padded[:len(act)] = act
+            grid = padded.reshape(h, w)
+            axes[i + 1].imshow(grid, cmap=layer_colors[i % len(layer_colors)],
+                               vmin=0, vmax=1, interpolation='nearest')
             active = int(activations[i][frame].sum())
             axes[i + 1].set_title(
                 f"Layer {i+1}\n{active}/{layer_sizes[i]} gates", fontsize=11)
